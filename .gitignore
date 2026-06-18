@@ -1,0 +1,21 @@
+# --- 画像・RAWファイル関係 ---
+# Nikon RAW とサイドカー
+*.NEF
+*.NEF.xmp
+*.xmp
+
+# 本プロジェクト独自フォーマット
+*.spcraw
+*.spc
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- ビルド成果物 ---
+*.o
+*.out
+a.out

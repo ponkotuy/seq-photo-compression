@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -18,6 +19,8 @@ import numpy as np
 
 MAGIC = b"SPCNEF1\0"
 ARCHIVE_EXT = ".spcraw"
+MOTION_HELPER_ENV = "SPC_MOTION_RESIDUAL_HELPER"
+MOTION_HELPER_NAME = "spc_motion_residual"
 
 TAG_BITS_PER_SAMPLE = 258
 TAG_COMPRESSION = 259
@@ -96,6 +99,16 @@ def run_checked(args: list[str], *, input_bytes: bytes | None = None) -> bytes:
     return result.stdout
 
 
+def parse_key_value_output(output: bytes) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in output.decode("utf-8", errors="replace").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        result[key] = value
+    return result
+
+
 def zstd_compress(data: bytes, level: int) -> bytes:
     require_command("zstd")
     return run_checked(["zstd", "-q", f"-{level}", "-T0", "-c"], input_bytes=data)
@@ -104,6 +117,144 @@ def zstd_compress(data: bytes, level: int) -> bytes:
 def zstd_decompress(data: bytes) -> bytes:
     require_command("zstd")
     return run_checked(["zstd", "-q", "-d", "-c"], input_bytes=data)
+
+
+def build_motion_helper() -> Path:
+    override = os.environ.get(MOTION_HELPER_ENV)
+    if override:
+        helper = Path(override)
+        if not helper.is_file():
+            raise SpcError(f"{MOTION_HELPER_ENV} does not point to a file: {helper}")
+        return helper
+
+    require_command("g++")
+    root = Path(__file__).resolve().parent
+    source = root / "tools" / f"{MOTION_HELPER_NAME}.cpp"
+    if not source.is_file():
+        raise SpcError(f"motion residual helper source not found: {source}")
+
+    helper = Path(tempfile.gettempdir()) / MOTION_HELPER_NAME
+    needs_build = not helper.exists() or helper.stat().st_mtime < source.stat().st_mtime
+    if needs_build:
+        run_checked(
+            [
+                "g++",
+                "-std=c++17",
+                "-O2",
+                str(source),
+                "-I/usr/include/opencv4",
+                "-o",
+                str(helper),
+                "-lopencv_video",
+                "-lopencv_imgproc",
+                "-lopencv_core",
+            ]
+        )
+    return helper
+
+
+def encode_jxl_residual(
+    base_raw: np.ndarray,
+    target_raw: np.ndarray,
+    *,
+    motion_mode: str,
+    effort: int,
+) -> tuple[bytes, dict]:
+    require_command("cjxl")
+    helper = build_motion_helper()
+    height = int(target_raw.shape[0])
+    width = int(target_raw.shape[1])
+
+    with tempfile.TemporaryDirectory(prefix="spc-jxl-") as tmp:
+        tmp_dir = Path(tmp)
+        base_path = tmp_dir / "base.raw"
+        target_path = tmp_dir / "target.raw"
+        residual_pam = tmp_dir / "residual.pam"
+        residual_jxl = tmp_dir / "residual.jxl"
+        base_path.write_bytes(raw_to_little_endian_bytes(base_raw))
+        target_path.write_bytes(raw_to_little_endian_bytes(target_raw))
+
+        stats = parse_key_value_output(
+            run_checked(
+                [
+                    str(helper),
+                    "encode",
+                    motion_mode,
+                    str(width),
+                    str(height),
+                    str(base_path),
+                    str(target_path),
+                    str(residual_pam),
+                ]
+            )
+        )
+        run_checked(
+            [
+                "cjxl",
+                str(residual_pam),
+                str(residual_jxl),
+                "--distance=0",
+                "--modular=1",
+                f"--effort={effort}",
+                "--quiet",
+            ]
+        )
+        payload = residual_jxl.read_bytes()
+
+    metadata = {
+        "compression": "jxl_modular",
+        "source": "rggb4_residual_u16_pam",
+        "motion_mode": motion_mode,
+        "motion_status": stats.get("status", "unknown"),
+        "motion_score": float(stats.get("score", "0")),
+        "motion_matrix": stats.get("matrix", "1,0,0;0,1,0"),
+        "residual_min": int(stats.get("residual_min", "0")),
+        "residual_max": int(stats.get("residual_max", "0")),
+        "residual_offset": int(stats.get("offset", "32768")),
+        "jxl_effort": effort,
+    }
+    return payload, metadata
+
+
+def decode_jxl_residual(
+    header: dict,
+    base_raw: np.ndarray,
+    residual_jxl: bytes,
+) -> np.ndarray:
+    require_command("djxl")
+    helper = build_motion_helper()
+    height = int(header["raw"]["height"])
+    width = int(header["raw"]["width"])
+    diff_info = header["diff"]
+
+    with tempfile.TemporaryDirectory(prefix="spc-jxl-") as tmp:
+        tmp_dir = Path(tmp)
+        base_path = tmp_dir / "base.raw"
+        residual_jxl_path = tmp_dir / "residual.jxl"
+        residual_pam_path = tmp_dir / "residual.pam"
+        restored_path = tmp_dir / "restored.raw"
+        base_path.write_bytes(raw_to_little_endian_bytes(base_raw))
+        residual_jxl_path.write_bytes(residual_jxl)
+        run_checked(["djxl", str(residual_jxl_path), str(residual_pam_path), "--quiet"])
+        run_checked(
+            [
+                str(helper),
+                "restore",
+                str(diff_info["motion_mode"]),
+                str(width),
+                str(height),
+                str(diff_info["motion_matrix"]),
+                str(base_path),
+                str(residual_pam_path),
+                str(restored_path),
+            ]
+        )
+        raw_bytes = restored_path.read_bytes()
+
+    expected = height * width * np.dtype("<u2").itemsize
+    if len(raw_bytes) != expected:
+        raise SpcError(f"restored RAW size mismatch: expected {expected}, got {len(raw_bytes)}")
+    return np.frombuffer(raw_bytes, dtype="<u2").astype(np.uint16, copy=True).reshape((height, width))
 
 
 def extract_raw_array(nef_path: Path) -> np.ndarray:
@@ -374,6 +525,16 @@ def load_diff(header: dict, diff_zstd: bytes) -> np.ndarray:
     return np.frombuffer(raw_diff, dtype="<i2").reshape((height, width))
 
 
+def restore_raw_from_archive_payload(header: dict, base_raw: np.ndarray, diff_payload: bytes) -> np.ndarray:
+    compression = header["diff"]["compression"]
+    if compression == "zstd":
+        diff = load_diff(header, diff_payload)
+        return restore_raw_from_diff(base_raw, diff)
+    if compression == "jxl_modular":
+        return decode_jxl_residual(header, base_raw, diff_payload)
+    raise SpcError(f"unsupported diff compression: {compression}")
+
+
 def default_archive_path(target: Path) -> Path:
     return target.with_suffix(target.suffix + ARCHIVE_EXT)
 
@@ -385,11 +546,26 @@ def cmd_encode(args: argparse.Namespace) -> None:
 
     base_raw = extract_raw_array(keyframe)
     target_raw = extract_raw_array(target)
-    diff = build_diff(base_raw, target_raw)
 
     shell, raw_info = make_zeroed_shell(target)
     shell_zstd = zstd_compress(shell, args.zstd_level)
-    diff_zstd = zstd_compress(diff.tobytes(order="C"), args.zstd_level)
+    if args.diff_codec == "zstd":
+        diff = build_diff(base_raw, target_raw)
+        diff_payload = zstd_compress(diff.tobytes(order="C"), args.zstd_level)
+        diff_header = {
+            "compression": "zstd",
+            "min": int(diff.min()),
+            "max": int(diff.max()),
+        }
+    elif args.diff_codec == "jxl":
+        diff_payload, diff_header = encode_jxl_residual(
+            base_raw,
+            target_raw,
+            motion_mode=args.motion_mode,
+            effort=args.jxl_effort,
+        )
+    else:
+        raise SpcError(f"unsupported diff codec: {args.diff_codec}")
 
     header = {
         "version": 1,
@@ -420,13 +596,9 @@ def cmd_encode(args: argparse.Namespace) -> None:
                 "bits_per_sample_entry_pos": raw_info.bits_per_sample_entry_pos,
             },
         },
-        "diff": {
-            "compression": "zstd",
-            "min": int(diff.min()),
-            "max": int(diff.max()),
-        },
+        "diff": diff_header,
     }
-    write_archive(output, header, shell_zstd, diff_zstd, force=args.force)
+    write_archive(output, header, shell_zstd, diff_payload, force=args.force)
 
     archive_size = output.stat().st_size
     target_size = target.stat().st_size
@@ -435,7 +607,16 @@ def cmd_encode(args: argparse.Namespace) -> None:
     print(f"target NEF size: {target_size:,} bytes")
     print(f"archive size: {archive_size:,} bytes ({ratio:.2%} of target)")
     print(f"raw shape: {target_raw.shape[1]}x{target_raw.shape[0]}")
-    print(f"diff range: {int(diff.min())}..{int(diff.max())}")
+    if args.diff_codec == "zstd":
+        print(f"diff codec: zstd")
+        print(f"diff range: {int(diff_header['min'])}..{int(diff_header['max'])}")
+    else:
+        print(f"diff codec: jxl_modular")
+        print(f"motion mode: {diff_header['motion_mode']}")
+        print(f"motion status: {diff_header['motion_status']}")
+        print(f"motion score: {diff_header['motion_score']:.6f}")
+        print(f"residual range: {diff_header['residual_min']}..{diff_header['residual_max']}")
+        print(f"jxl effort: {diff_header['jxl_effort']}")
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -443,14 +624,13 @@ def cmd_verify(args: argparse.Namespace) -> None:
     target = Path(args.target)
     archive = Path(args.archive)
 
-    header, _shell_zstd, diff_zstd = read_archive(archive)
+    header, _shell_zstd, diff_payload = read_archive(archive)
     if sha256_file(keyframe) != header["keyframe"]["sha256"]:
         raise SpcError("keyframe SHA-256 does not match archive metadata")
 
     base_raw = extract_raw_array(keyframe)
     target_raw = extract_raw_array(target)
-    diff = load_diff(header, diff_zstd)
-    restored = restore_raw_from_diff(base_raw, diff)
+    restored = restore_raw_from_archive_payload(header, base_raw, diff_payload)
     equal = np.array_equal(restored, target_raw)
     differing = 0 if equal else int(np.count_nonzero(restored != target_raw))
     print(f"raw match: {equal}")
@@ -466,13 +646,12 @@ def cmd_restore(args: argparse.Namespace) -> None:
     if output.exists() and not args.force:
         raise SpcError(f"output exists, pass --force to overwrite: {output}")
 
-    header, shell_zstd, diff_zstd = read_archive(archive)
+    header, shell_zstd, diff_payload = read_archive(archive)
     if sha256_file(keyframe) != header["keyframe"]["sha256"]:
         raise SpcError("keyframe SHA-256 does not match archive metadata")
 
     base_raw = extract_raw_array(keyframe)
-    diff = load_diff(header, diff_zstd)
-    restored_raw = restore_raw_from_diff(base_raw, diff)
+    restored_raw = restore_raw_from_archive_payload(header, base_raw, diff_payload)
 
     shell = zstd_decompress(shell_zstd)
     raw_bytes = raw_to_little_endian_bytes(restored_raw)
@@ -501,6 +680,9 @@ def build_parser() -> argparse.ArgumentParser:
     encode.add_argument("keyframe", help="first NEF kept as keyframe")
     encode.add_argument("target", help="second NEF to encode as custom format")
     encode.add_argument("-o", "--output", help=f"output archive path, default: TARGET.NEF{ARCHIVE_EXT}")
+    encode.add_argument("--diff-codec", choices=("zstd", "jxl"), default="jxl")
+    encode.add_argument("--motion-mode", choices=("none", "translation", "ecc_affine"), default="ecc_affine")
+    encode.add_argument("--jxl-effort", type=int, default=6, choices=range(1, 11), metavar="1-10")
     encode.add_argument("--zstd-level", type=int, default=10, choices=range(1, 20), metavar="1-19")
     encode.add_argument("--force", action="store_true", help="overwrite output archive")
     encode.set_defaults(func=cmd_encode)
