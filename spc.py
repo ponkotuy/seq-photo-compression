@@ -407,7 +407,7 @@ def make_zeroed_shell(target_nef: Path) -> tuple[bytes, RawStripInfo]:
     end = raw.strip_offset + raw.strip_byte_count
     if raw.strip_offset < 0 or end > len(data):
         raise SpcError("raw strip points outside target NEF")
-    data[raw.strip_offset:end] = b"\0" * raw.strip_byte_count
+    data[raw.strip_offset : end] = b"\0" * raw.strip_byte_count
     return bytes(data), raw
 
 
@@ -675,7 +675,9 @@ def patch_shell_for_uncompressed_raw(shell: bytes, raw_info: dict, raw_bytes: by
     return bytes(data)
 
 
-def patch_shell_for_nikon_compressed_raw(shell: bytes, target_shell_info: dict, raw_info: dict, compressed_raw: bytes) -> bytes:
+def patch_shell_for_nikon_compressed_raw(
+    shell: bytes, target_shell_info: dict, raw_info: dict, compressed_raw: bytes
+) -> bytes:
     data = bytearray(shell)
     parser = TiffParser(data)
     original_offset = int(target_shell_info["zeroed_raw_strip_offset"])

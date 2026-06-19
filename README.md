@@ -69,6 +69,24 @@ Pythonパッケージは `uv` で管理する。
 uv sync
 ```
 
+開発用ツールも含める場合:
+
+```sh
+uv sync --dev
+```
+
+Pythonコードのフォーマット:
+
+```sh
+uv run ruff format .
+```
+
+フォーマット済みか確認する場合:
+
+```sh
+uv run ruff format --check .
+```
+
 例:
 
 ```sh

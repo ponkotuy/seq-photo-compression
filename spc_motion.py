@@ -173,8 +173,7 @@ def write_pam_residual(
     predictor: list[np.ndarray],
 ) -> tuple[int, int]:
     residual_planes = [
-        target.astype(np.int32) - pred.astype(np.int32)
-        for target, pred in zip(target_planes, predictor, strict=True)
+        target.astype(np.int32) - pred.astype(np.int32) for target, pred in zip(target_planes, predictor, strict=True)
     ]
     residual = np.stack(residual_planes, axis=2)
     residual_min = int(residual.min())
@@ -185,13 +184,7 @@ def write_pam_residual(
 
     plane_height, plane_width = target_planes[0].shape
     header = (
-        "P7\n"
-        f"WIDTH {plane_width}\n"
-        f"HEIGHT {plane_height}\n"
-        "DEPTH 4\n"
-        "MAXVAL 65535\n"
-        "TUPLTYPE RGB_ALPHA\n"
-        "ENDHDR\n"
+        f"P7\nWIDTH {plane_width}\nHEIGHT {plane_height}\nDEPTH 4\nMAXVAL 65535\nTUPLTYPE RGB_ALPHA\nENDHDR\n"
     ).encode("ascii")
     path.write_bytes(header + coded.astype(">u2").tobytes(order="C"))
     return residual_min, residual_max
@@ -281,8 +274,5 @@ def restore_from_residual_pam(
     restored = predictor_stack + residual_values
     if int(restored.min()) < 0 or int(restored.max()) > 65535:
         raise MotionResidualError("restored RAW value outside uint16 range")
-    restored_planes = [
-        np.ascontiguousarray(restored[:, :, channel].astype(np.uint16))
-        for channel in range(CHANNELS)
-    ]
+    restored_planes = [np.ascontiguousarray(restored[:, :, channel].astype(np.uint16)) for channel in range(CHANNELS)]
     return merge_rggb(restored_planes)
