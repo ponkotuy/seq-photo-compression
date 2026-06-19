@@ -27,6 +27,9 @@ TAG_STRIP_OFFSETS = 273
 TAG_STRIP_BYTE_COUNTS = 279
 TAG_SUB_IFDS = 330
 
+TIFF_COMPRESSION_NONE = 1
+TIFF_COMPRESSION_NIKON_NEF = 34713
+
 TYPE_SHORT = 3
 TYPE_LONG = 4
 TYPE_SIZES = {
@@ -64,6 +67,8 @@ class TiffIfd:
 class RawStripInfo:
     strip_offset: int
     strip_byte_count: int
+    compression: int
+    bits_per_sample: int | None
     compression_entry_pos: int
     strip_offset_entry_pos: int
     strip_byte_count_entry_pos: int
@@ -378,10 +383,14 @@ class TiffParser:
         strip_counts = self.entry_values(ifd.entries[TAG_STRIP_BYTE_COUNTS])
         if len(strip_offsets) != 1 or len(strip_counts) != 1:
             raise SpcError("only single-strip NEF files are supported in phase 1")
+        compression_value = self.entry_values(ifd.entries[TAG_COMPRESSION])[0]
         bits_entry = ifd.entries.get(TAG_BITS_PER_SAMPLE)
+        bits_per_sample = self.entry_values(bits_entry)[0] if bits_entry is not None else None
         return RawStripInfo(
             strip_offset=strip_offsets[0],
             strip_byte_count=strip_counts[0],
+            compression=compression_value,
+            bits_per_sample=bits_per_sample,
             compression_entry_pos=ifd.entries[TAG_COMPRESSION].value_offset_pos,
             strip_offset_entry_pos=ifd.entries[TAG_STRIP_OFFSETS].value_offset_pos,
             strip_byte_count_entry_pos=ifd.entries[TAG_STRIP_BYTE_COUNTS].value_offset_pos,
@@ -400,6 +409,245 @@ def make_zeroed_shell(target_nef: Path) -> tuple[bytes, RawStripInfo]:
         raise SpcError("raw strip points outside target NEF")
     data[raw.strip_offset:end] = b"\0" * raw.strip_byte_count
     return bytes(data), raw
+
+
+NIKON_LOSSLESS_14_TREE = (
+    0,
+    1,
+    4,
+    2,
+    2,
+    3,
+    1,
+    2,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    7,
+    6,
+    8,
+    5,
+    9,
+    4,
+    10,
+    3,
+    11,
+    12,
+    2,
+    0,
+    1,
+    13,
+    14,
+)
+
+
+class BitReader:
+    def __init__(self, data: bytes):
+        self.data = data
+        self.byte_pos = 0
+        self.bitbuf = 0
+        self.vbits = 0
+
+    def get(self, nbits: int) -> int:
+        while self.vbits < nbits:
+            if self.byte_pos >= len(self.data):
+                raise SpcError("unexpected EOF in Nikon compressed RAW")
+            self.bitbuf = (self.bitbuf << 8) | self.data[self.byte_pos]
+            self.byte_pos += 1
+            self.vbits += 8
+        shift = self.vbits - nbits
+        value = (self.bitbuf >> shift) & ((1 << nbits) - 1)
+        self.vbits -= nbits
+        self.bitbuf &= (1 << self.vbits) - 1 if self.vbits else 0
+        return value
+
+
+class BitWriter:
+    def __init__(self):
+        self.out = bytearray()
+        self.bitbuf = 0
+        self.vbits = 0
+
+    def put(self, value: int, nbits: int) -> None:
+        if nbits == 0:
+            return
+        self.bitbuf = (self.bitbuf << nbits) | (value & ((1 << nbits) - 1))
+        self.vbits += nbits
+        while self.vbits >= 8:
+            shift = self.vbits - 8
+            self.out.append((self.bitbuf >> shift) & 0xFF)
+            self.vbits -= 8
+            self.bitbuf &= (1 << self.vbits) - 1 if self.vbits else 0
+
+    def finish(self, *, padding_bits: int = 0, padding_value: int = 0) -> bytes:
+        if self.vbits:
+            needed = 8 - self.vbits
+            if padding_bits != needed:
+                padding_value = 0
+            self.out.append(((self.bitbuf << needed) | (padding_value & ((1 << needed) - 1))) & 0xFF)
+            self.bitbuf = 0
+            self.vbits = 0
+        return bytes(self.out)
+
+
+def build_huffman_codes(tree: tuple[int, ...]) -> dict[int, tuple[int, int]]:
+    codes: dict[int, tuple[int, int]] = {}
+    code = 0
+    symbol_pos = 16
+    for bit_length, count in enumerate(tree[:16], start=1):
+        for _ in range(count):
+            symbol = tree[symbol_pos]
+            symbol_pos += 1
+            codes[symbol] = (code, bit_length)
+            code += 1
+        code <<= 1
+    return codes
+
+
+def build_huffman_decoder(tree: tuple[int, ...]) -> dict[tuple[int, int], int]:
+    return {(length, code): symbol for symbol, (code, length) in build_huffman_codes(tree).items()}
+
+
+NIKON_LOSSLESS_14_CODES = build_huffman_codes(NIKON_LOSSLESS_14_TREE)
+NIKON_LOSSLESS_14_DECODER = build_huffman_decoder(NIKON_LOSSLESS_14_TREE)
+NIKON_LOSSLESS_14_MAX_CODE_BITS = max(length for _code, length in NIKON_LOSSLESS_14_CODES.values())
+
+
+def read_huffman_symbol(reader: BitReader) -> int:
+    code = 0
+    for length in range(1, NIKON_LOSSLESS_14_MAX_CODE_BITS + 1):
+        code = (code << 1) | reader.get(1)
+        symbol = NIKON_LOSSLESS_14_DECODER.get((length, code))
+        if symbol is not None:
+            return symbol
+    raise SpcError("invalid Nikon lossless Huffman code")
+
+
+def decode_nikon_lossless_14_diff(reader: BitReader) -> int:
+    symbol = read_huffman_symbol(reader)
+    length = symbol & 15
+    shift = symbol >> 4
+    if shift:
+        raise SpcError("unsupported shifted Nikon lossless symbol")
+    if length == 0:
+        return 0
+    diff_bits = reader.get(length)
+    if diff_bits & (1 << (length - 1)):
+        return diff_bits
+    return diff_bits - ((1 << length) - 1)
+
+
+def get_raw_strip_bytes(nef_path: Path, raw_info: RawStripInfo) -> bytes:
+    with nef_path.open("rb") as f:
+        f.seek(raw_info.strip_offset)
+        return f.read(raw_info.strip_byte_count)
+
+
+def derive_nikon_lossless_14_restore_info(
+    target_nef: Path,
+    raw_info: RawStripInfo,
+    target_raw: np.ndarray,
+) -> dict | None:
+    if raw_info.compression != TIFF_COMPRESSION_NIKON_NEF or raw_info.bits_per_sample != 14:
+        return None
+
+    strip = get_raw_strip_bytes(target_nef, raw_info)
+    reader = BitReader(strip)
+    raw_view = target_raw
+    height, width = raw_view.shape
+    vpred: list[list[int | None]] = [[None, None], [None, None]]
+    initial_vpred: list[list[int | None]] = [[None, None], [None, None]]
+    hpred = [0, 0]
+
+    for row in range(height):
+        parity = row & 1
+        for col in range(width):
+            diff = decode_nikon_lossless_14_diff(reader)
+            expected = int(raw_view[row, col])
+            if col < 2:
+                current = vpred[parity][col]
+                if current is None:
+                    initial = expected - diff
+                    if initial < 0 or initial > 0x3FFF:
+                        raise SpcError("invalid Nikon lossless initial predictor")
+                    initial_vpred[parity][col] = initial
+                    vpred[parity][col] = expected
+                    hpred[col] = expected
+                    continue
+                value = current + diff
+                vpred[parity][col] = value
+                hpred[col] = value
+            else:
+                value = hpred[col & 1] + diff
+                hpred[col & 1] = value
+            if value != expected:
+                return None
+
+    if any(item is None for row_values in initial_vpred for item in row_values):
+        return None
+    return {
+        "codec": "nikon_lossless_14",
+        "compression_tag": TIFF_COMPRESSION_NIKON_NEF,
+        "bits_per_sample": 14,
+        "initial_vpred": initial_vpred,
+        "padding_bits": reader.vbits,
+        "padding_value": reader.bitbuf,
+        "trailing_bytes": strip[reader.byte_pos :].hex(),
+    }
+
+
+def encode_nikon_lossless_14(
+    raw: np.ndarray,
+    initial_vpred: list[list[int]],
+    *,
+    padding_bits: int = 0,
+    padding_value: int = 0,
+    trailing_bytes: bytes = b"",
+) -> bytes:
+    if raw.dtype != np.uint16:
+        raw = raw.astype(np.uint16, copy=False)
+    codes = NIKON_LOSSLESS_14_CODES
+    writer = BitWriter()
+    vpred = [
+        [int(initial_vpred[0][0]), int(initial_vpred[0][1])],
+        [int(initial_vpred[1][0]), int(initial_vpred[1][1])],
+    ]
+    hpred = [0, 0]
+    height, width = raw.shape
+
+    for row in range(height):
+        parity = row & 1
+        for col in range(width):
+            value = int(raw[row, col])
+            if value < 0 or value > 0x3FFF:
+                raise SpcError("Nikon lossless 14-bit output requires RAW values in 0..16383")
+            if col < 2:
+                pred = vpred[parity][col]
+                diff = value - pred
+                vpred[parity][col] = value
+                hpred[col] = value
+            else:
+                pred = hpred[col & 1]
+                diff = value - pred
+                hpred[col & 1] = value
+
+            length = abs(diff).bit_length()
+            if length > 14:
+                raise SpcError("Nikon lossless diff does not fit 14 bits")
+            code, code_bits = codes[length]
+            writer.put(code, code_bits)
+            if length:
+                if diff < 0:
+                    diff_bits = diff + (1 << length) - 1
+                else:
+                    diff_bits = diff
+                writer.put(diff_bits, length)
+    return writer.finish(padding_bits=padding_bits, padding_value=padding_value) + trailing_bytes
 
 
 def patch_short_inline(data: bytearray, endian: str, value_offset_pos: int, value: int) -> None:
@@ -421,9 +669,31 @@ def patch_shell_for_uncompressed_raw(shell: bytes, raw_info: dict, raw_bytes: by
     strip_offset_pos = int(raw_info["strip_offset_entry_pos"])
     strip_byte_count_pos = int(raw_info["strip_byte_count_entry_pos"])
 
-    patch_short_inline(data, parser.endian, compression_pos, 1)
+    patch_short_inline(data, parser.endian, compression_pos, TIFF_COMPRESSION_NONE)
     patch_long_inline(data, parser.endian, strip_offset_pos, append_offset)
     patch_long_inline(data, parser.endian, strip_byte_count_pos, len(raw_bytes))
+    return bytes(data)
+
+
+def patch_shell_for_nikon_compressed_raw(shell: bytes, target_shell_info: dict, raw_info: dict, compressed_raw: bytes) -> bytes:
+    data = bytearray(shell)
+    parser = TiffParser(data)
+    original_offset = int(target_shell_info["zeroed_raw_strip_offset"])
+    original_count = int(target_shell_info["zeroed_raw_strip_byte_count"])
+    if len(compressed_raw) <= original_count:
+        strip_offset = original_offset
+        data[strip_offset : strip_offset + len(compressed_raw)] = compressed_raw
+    else:
+        strip_offset = len(data)
+        data.extend(compressed_raw)
+
+    compression_pos = int(raw_info["compression_entry_pos"])
+    strip_offset_pos = int(raw_info["strip_offset_entry_pos"])
+    strip_byte_count_pos = int(raw_info["strip_byte_count_entry_pos"])
+
+    patch_short_inline(data, parser.endian, compression_pos, TIFF_COMPRESSION_NIKON_NEF)
+    patch_long_inline(data, parser.endian, strip_offset_pos, strip_offset)
+    patch_long_inline(data, parser.endian, strip_byte_count_pos, len(compressed_raw))
     return bytes(data)
 
 
@@ -480,6 +750,10 @@ def cmd_encode(args: argparse.Namespace) -> None:
     target_raw = extract_raw_array(target)
 
     shell, raw_info = make_zeroed_shell(target)
+    try:
+        nikon_restore_info = derive_nikon_lossless_14_restore_info(target, raw_info, target_raw)
+    except SpcError:
+        nikon_restore_info = None
     shell_zstd = zstd_compress(shell, args.zstd_level)
     if args.diff_codec == "zstd":
         diff = build_diff(base_raw, target_raw)
@@ -519,6 +793,9 @@ def cmd_encode(args: argparse.Namespace) -> None:
         },
         "target_shell": {
             "compression": "zstd",
+            "original_raw_compression_tag": raw_info.compression,
+            "original_bits_per_sample": raw_info.bits_per_sample,
+            "raw_restore": nikon_restore_info,
             "zeroed_raw_strip_offset": raw_info.strip_offset,
             "zeroed_raw_strip_byte_count": raw_info.strip_byte_count,
             "tiff_patch": {
@@ -549,6 +826,10 @@ def cmd_encode(args: argparse.Namespace) -> None:
         print(f"motion score: {diff_header['motion_score']:.6f}")
         print(f"residual range: {diff_header['residual_min']}..{diff_header['residual_max']}")
         print(f"jxl effort: {diff_header['jxl_effort']}")
+    if nikon_restore_info is not None:
+        print("restore RAW codec: nikon_lossless_14")
+    else:
+        print("restore RAW codec: uncompressed")
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -586,11 +867,34 @@ def cmd_restore(args: argparse.Namespace) -> None:
     restored_raw = restore_raw_from_archive_payload(header, base_raw, diff_payload)
 
     shell = zstd_decompress(shell_zstd)
-    raw_bytes = raw_to_little_endian_bytes(restored_raw)
-    restored_nef = patch_shell_for_uncompressed_raw(shell, header["target_shell"]["tiff_patch"], raw_bytes)
+    raw_restore_info = header["target_shell"].get("raw_restore")
+    if args.raw_output in ("auto", "nikon") and raw_restore_info is not None:
+        if raw_restore_info.get("codec") != "nikon_lossless_14":
+            raise SpcError(f"unsupported restore RAW codec: {raw_restore_info.get('codec')}")
+        compressed_raw = encode_nikon_lossless_14(
+            restored_raw,
+            raw_restore_info["initial_vpred"],
+            padding_bits=int(raw_restore_info.get("padding_bits", 0)),
+            padding_value=int(raw_restore_info.get("padding_value", 0)),
+            trailing_bytes=bytes.fromhex(str(raw_restore_info.get("trailing_bytes", ""))),
+        )
+        restored_nef = patch_shell_for_nikon_compressed_raw(
+            shell,
+            header["target_shell"],
+            header["target_shell"]["tiff_patch"],
+            compressed_raw,
+        )
+        restored_codec = "nikon_lossless_14"
+    elif args.raw_output == "nikon":
+        raise SpcError("archive does not contain Nikon lossless restore metadata; re-run encode with this version")
+    else:
+        raw_bytes = raw_to_little_endian_bytes(restored_raw)
+        restored_nef = patch_shell_for_uncompressed_raw(shell, header["target_shell"]["tiff_patch"], raw_bytes)
+        restored_codec = "uncompressed"
     output.write_bytes(restored_nef)
     print(f"restored NEF-like file: {output}")
     print(f"output size: {output.stat().st_size:,} bytes")
+    print(f"restore RAW codec: {restored_codec}")
     xmp_sidecar = Path(str(output) + ".xmp")
     if xmp_sidecar.exists():
         print(
@@ -629,6 +933,7 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("keyframe")
     restore.add_argument("archive")
     restore.add_argument("-o", "--output", required=True)
+    restore.add_argument("--raw-output", choices=("auto", "nikon", "uncompressed"), default="auto")
     restore.add_argument("--force", action="store_true", help="overwrite output file")
     restore.set_defaults(func=cmd_restore)
 
