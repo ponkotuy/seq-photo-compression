@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import shutil
 import struct
 import subprocess
@@ -16,11 +15,11 @@ from typing import BinaryIO
 
 import numpy as np
 
+from spc_motion import MotionResidualError, encode_residual_pam, restore_from_residual_pam
+
 
 MAGIC = b"SPCNEF1\0"
 ARCHIVE_EXT = ".spcraw"
-MOTION_HELPER_ENV = "SPC_MOTION_RESIDUAL_HELPER"
-MOTION_HELPER_NAME = "spc_motion_residual"
 
 TAG_BITS_PER_SAMPLE = 258
 TAG_COMPRESSION = 259
@@ -99,16 +98,6 @@ def run_checked(args: list[str], *, input_bytes: bytes | None = None) -> bytes:
     return result.stdout
 
 
-def parse_key_value_output(output: bytes) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for line in output.decode("utf-8", errors="replace").splitlines():
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        result[key] = value
-    return result
-
-
 def zstd_compress(data: bytes, level: int) -> bytes:
     require_command("zstd")
     return run_checked(["zstd", "-q", f"-{level}", "-T0", "-c"], input_bytes=data)
@@ -119,40 +108,6 @@ def zstd_decompress(data: bytes) -> bytes:
     return run_checked(["zstd", "-q", "-d", "-c"], input_bytes=data)
 
 
-def build_motion_helper() -> Path:
-    override = os.environ.get(MOTION_HELPER_ENV)
-    if override:
-        helper = Path(override)
-        if not helper.is_file():
-            raise SpcError(f"{MOTION_HELPER_ENV} does not point to a file: {helper}")
-        return helper
-
-    require_command("g++")
-    root = Path(__file__).resolve().parent
-    source = root / "tools" / f"{MOTION_HELPER_NAME}.cpp"
-    if not source.is_file():
-        raise SpcError(f"motion residual helper source not found: {source}")
-
-    helper = Path(tempfile.gettempdir()) / MOTION_HELPER_NAME
-    needs_build = not helper.exists() or helper.stat().st_mtime < source.stat().st_mtime
-    if needs_build:
-        run_checked(
-            [
-                "g++",
-                "-std=c++17",
-                "-O2",
-                str(source),
-                "-I/usr/include/opencv4",
-                "-o",
-                str(helper),
-                "-lopencv_video",
-                "-lopencv_imgproc",
-                "-lopencv_core",
-            ]
-        )
-    return helper
-
-
 def encode_jxl_residual(
     base_raw: np.ndarray,
     target_raw: np.ndarray,
@@ -161,33 +116,20 @@ def encode_jxl_residual(
     effort: int,
 ) -> tuple[bytes, dict]:
     require_command("cjxl")
-    helper = build_motion_helper()
-    height = int(target_raw.shape[0])
-    width = int(target_raw.shape[1])
 
     with tempfile.TemporaryDirectory(prefix="spc-jxl-") as tmp:
         tmp_dir = Path(tmp)
-        base_path = tmp_dir / "base.raw"
-        target_path = tmp_dir / "target.raw"
         residual_pam = tmp_dir / "residual.pam"
         residual_jxl = tmp_dir / "residual.jxl"
-        base_path.write_bytes(raw_to_little_endian_bytes(base_raw))
-        target_path.write_bytes(raw_to_little_endian_bytes(target_raw))
-
-        stats = parse_key_value_output(
-            run_checked(
-                [
-                    str(helper),
-                    "encode",
-                    motion_mode,
-                    str(width),
-                    str(height),
-                    str(base_path),
-                    str(target_path),
-                    str(residual_pam),
-                ]
+        try:
+            stats = encode_residual_pam(
+                base_raw,
+                target_raw,
+                motion_mode=motion_mode,
+                output=residual_pam,
             )
-        )
+        except MotionResidualError as exc:
+            raise SpcError(str(exc)) from exc
         run_checked(
             [
                 "cjxl",
@@ -205,12 +147,12 @@ def encode_jxl_residual(
         "compression": "jxl_modular",
         "source": "rggb4_residual_u16_pam",
         "motion_mode": motion_mode,
-        "motion_status": stats.get("status", "unknown"),
-        "motion_score": float(stats.get("score", "0")),
-        "motion_matrix": stats.get("matrix", "1,0,0;0,1,0"),
-        "residual_min": int(stats.get("residual_min", "0")),
-        "residual_max": int(stats.get("residual_max", "0")),
-        "residual_offset": int(stats.get("offset", "32768")),
+        "motion_status": stats.status,
+        "motion_score": stats.score,
+        "motion_matrix": stats.matrix,
+        "residual_min": stats.residual_min,
+        "residual_max": stats.residual_max,
+        "residual_offset": stats.offset,
         "jxl_effort": effort,
     }
     return payload, metadata
@@ -222,39 +164,29 @@ def decode_jxl_residual(
     residual_jxl: bytes,
 ) -> np.ndarray:
     require_command("djxl")
-    helper = build_motion_helper()
     height = int(header["raw"]["height"])
     width = int(header["raw"]["width"])
     diff_info = header["diff"]
 
     with tempfile.TemporaryDirectory(prefix="spc-jxl-") as tmp:
         tmp_dir = Path(tmp)
-        base_path = tmp_dir / "base.raw"
         residual_jxl_path = tmp_dir / "residual.jxl"
         residual_pam_path = tmp_dir / "residual.pam"
-        restored_path = tmp_dir / "restored.raw"
-        base_path.write_bytes(raw_to_little_endian_bytes(base_raw))
         residual_jxl_path.write_bytes(residual_jxl)
         run_checked(["djxl", str(residual_jxl_path), str(residual_pam_path), "--quiet"])
-        run_checked(
-            [
-                str(helper),
-                "restore",
-                str(diff_info["motion_mode"]),
-                str(width),
-                str(height),
-                str(diff_info["motion_matrix"]),
-                str(base_path),
-                str(residual_pam_path),
-                str(restored_path),
-            ]
-        )
-        raw_bytes = restored_path.read_bytes()
+        try:
+            restored = restore_from_residual_pam(
+                base_raw,
+                residual_pam_path,
+                motion_mode=str(diff_info["motion_mode"]),
+                matrix=str(diff_info["motion_matrix"]),
+            )
+        except MotionResidualError as exc:
+            raise SpcError(str(exc)) from exc
 
-    expected = height * width * np.dtype("<u2").itemsize
-    if len(raw_bytes) != expected:
-        raise SpcError(f"restored RAW size mismatch: expected {expected}, got {len(raw_bytes)}")
-    return np.frombuffer(raw_bytes, dtype="<u2").astype(np.uint16, copy=True).reshape((height, width))
+    if restored.shape != (height, width):
+        raise SpcError(f"restored RAW shape mismatch: expected {(height, width)}, got {restored.shape}")
+    return restored
 
 
 def extract_raw_array(nef_path: Path) -> np.ndarray:
