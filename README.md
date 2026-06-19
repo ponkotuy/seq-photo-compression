@@ -89,6 +89,13 @@ uv run ruff format .
 uv run ruff format --check .
 ```
 
+コードメトリクスの確認:
+
+```sh
+uv run radon cc -s -a .
+uv run radon mi -s .
+```
+
 例:
 
 ```sh
