@@ -15,7 +15,5 @@ __pycache__/
 .venv/
 venv/
 
-# --- ビルド成果物 ---
-*.o
-*.out
-a.out
+# --- cProfile ---
+*.prof

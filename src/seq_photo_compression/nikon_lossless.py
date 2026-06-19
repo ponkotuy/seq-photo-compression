@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +42,24 @@ NIKON_LOSSLESS_14_TREE = (
     13,
     14,
 )
+
+TAG_EXIF_IFD = 0x8769
+TAG_MAKER_NOTE = 0x927C
+TAG_NIKON_COMPRESSION_INFO = 0x0096
+
+TYPE_LONG = 4
+TYPE_SIZES = {
+    1: 1,  # BYTE
+    2: 1,  # ASCII
+    3: 2,  # SHORT
+    4: 4,  # LONG
+    5: 8,  # RATIONAL
+    7: 1,  # UNDEFINED
+    8: 2,  # SSHORT
+    9: 4,  # SLONG
+    10: 8,  # SRATIONAL
+    13: 4,  # IFD
+}
 
 
 class BitReader:
@@ -113,6 +132,115 @@ def build_huffman_decoder(tree: tuple[int, ...]) -> dict[tuple[int, int], int]:
 NIKON_LOSSLESS_14_CODES = build_huffman_codes(NIKON_LOSSLESS_14_TREE)
 NIKON_LOSSLESS_14_DECODER = build_huffman_decoder(NIKON_LOSSLESS_14_TREE)
 NIKON_LOSSLESS_14_MAX_CODE_BITS = max(length for _code, length in NIKON_LOSSLESS_14_CODES.values())
+
+
+def _tiff_endian(data: bytes, offset: int) -> str:
+    if data[offset : offset + 2] == b"II":
+        return "<"
+    if data[offset : offset + 2] == b"MM":
+        return ">"
+    raise SpcError("not a TIFF byte order marker")
+
+
+def _u16(data: bytes, endian: str, offset: int) -> int:
+    return struct.unpack_from(endian + "H", data, offset)[0]
+
+
+def _u32(data: bytes, endian: str, offset: int) -> int:
+    return struct.unpack_from(endian + "I", data, offset)[0]
+
+
+def _read_ifd_entries(data: bytes, base: int, ifd_offset: int, endian: str) -> dict[int, tuple[int, int, int, int]]:
+    absolute = base + ifd_offset
+    if absolute <= 0 or absolute + 2 > len(data):
+        raise SpcError(f"invalid TIFF IFD offset: {ifd_offset}")
+    count = _u16(data, endian, absolute)
+    entries: dict[int, tuple[int, int, int, int]] = {}
+    pos = absolute + 2
+    if pos + count * 12 + 4 > len(data):
+        raise SpcError("TIFF IFD points outside file")
+    for _ in range(count):
+        tag = _u16(data, endian, pos)
+        type_id = _u16(data, endian, pos + 2)
+        value_count = _u32(data, endian, pos + 4)
+        value_offset_pos = pos + 8
+        size = TYPE_SIZES.get(type_id, 1) * value_count
+        data_offset = value_offset_pos if size <= 4 else base + _u32(data, endian, value_offset_pos)
+        if data_offset < 0 or data_offset + size > len(data):
+            raise SpcError("TIFF tag points outside file")
+        entries[tag] = (type_id, value_count, data_offset, value_offset_pos)
+        pos += 12
+    return entries
+
+
+def _entry_u32(data: bytes, endian: str, entry: tuple[int, int, int, int]) -> int:
+    type_id, value_count, data_offset, _value_offset_pos = entry
+    if type_id != TYPE_LONG or value_count < 1:
+        raise SpcError("TIFF tag is not a LONG value")
+    return _u32(data, endian, data_offset)
+
+
+def read_nikon_lossless_14_restore_info_from_makernote(
+    target_nef: Path,
+    raw_info: RawStripInfo,
+) -> dict | None:
+    if raw_info.compression != TIFF_COMPRESSION_NIKON_NEF or raw_info.bits_per_sample != 14:
+        return None
+
+    try:
+        data = target_nef.read_bytes()
+        endian = _tiff_endian(data, 0)
+        if _u16(data, endian, 2) != 42:
+            return None
+        ifd0 = _read_ifd_entries(data, 0, _u32(data, endian, 4), endian)
+        exif_entry = ifd0.get(TAG_EXIF_IFD)
+        if exif_entry is None:
+            return None
+        exif = _read_ifd_entries(data, 0, _entry_u32(data, endian, exif_entry), endian)
+        maker_entry = exif.get(TAG_MAKER_NOTE)
+        if maker_entry is None:
+            return None
+
+        _maker_type, maker_count, maker_offset, _maker_value_pos = maker_entry
+        if maker_count < 16 or data[maker_offset : maker_offset + 6] != b"Nikon\0":
+            return None
+        maker_base = maker_offset + 10
+        maker_endian = _tiff_endian(data, maker_base)
+        if _u16(data, maker_endian, maker_base + 2) != 42:
+            return None
+        maker_ifd = _read_ifd_entries(data, maker_base, _u32(data, maker_endian, maker_base + 4), maker_endian)
+        compression_entry = maker_ifd.get(TAG_NIKON_COMPRESSION_INFO)
+        if compression_entry is None:
+            return None
+
+        _type_id, value_count, compression_offset, _value_offset_pos = compression_entry
+        if value_count < 10:
+            return None
+        ver0 = data[compression_offset]
+        ver1 = data[compression_offset + 1]
+        pos = compression_offset + 2
+        if ver0 == 0x49 or ver1 == 0x58:
+            pos += 2110
+        # D850 lossless 14-bit NEFs use the F0 table. Other Nikon variants
+        # may need curves or split tables, so keep them on the old safe path.
+        if ver0 != 0x46 or pos + 10 > compression_offset + value_count:
+            return None
+
+        flat_vpred = struct.unpack_from(maker_endian + "4H", data, pos)
+        if any(value > 0x3FFF for value in flat_vpred):
+            return None
+        return {
+            "codec": "nikon_lossless_14",
+            "compression_tag": TIFF_COMPRESSION_NIKON_NEF,
+            "bits_per_sample": 14,
+            "initial_vpred": [
+                [int(flat_vpred[0]), int(flat_vpred[1])],
+                [int(flat_vpred[2]), int(flat_vpred[3])],
+            ],
+            "source": "nikon_makernote_compression_info",
+        }
+    except (IndexError, OSError, SpcError, struct.error):
+        return None
 
 
 def read_huffman_symbol(reader: BitReader) -> int:

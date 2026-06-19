@@ -16,7 +16,11 @@ from seq_photo_compression.codecs import (
     zstd_decompress,
 )
 from seq_photo_compression.errors import SpcError
-from seq_photo_compression.nikon_lossless import derive_nikon_lossless_14_restore_info, encode_nikon_lossless_14
+from seq_photo_compression.nikon_lossless import (
+    derive_nikon_lossless_14_restore_info,
+    encode_nikon_lossless_14,
+    read_nikon_lossless_14_restore_info_from_makernote,
+)
 from seq_photo_compression.raw_io import extract_raw_array, raw_to_little_endian_bytes, sha256_file
 from seq_photo_compression.tiff import make_zeroed_shell, patch_shell_for_nikon_compressed_raw
 from seq_photo_compression.tiff import patch_shell_for_uncompressed_raw
@@ -31,10 +35,12 @@ def cmd_encode(args: argparse.Namespace) -> None:
     target_raw = extract_raw_array(target)
 
     shell, raw_info = make_zeroed_shell(target)
-    try:
-        nikon_restore_info = derive_nikon_lossless_14_restore_info(target, raw_info, target_raw)
-    except SpcError:
-        nikon_restore_info = None
+    nikon_restore_info = read_nikon_lossless_14_restore_info_from_makernote(target, raw_info)
+    if nikon_restore_info is None:
+        try:
+            nikon_restore_info = derive_nikon_lossless_14_restore_info(target, raw_info, target_raw)
+        except SpcError:
+            nikon_restore_info = None
     shell_zstd = zstd_compress(shell, args.zstd_level)
     if args.diff_codec == "zstd":
         diff = build_diff(base_raw, target_raw)
