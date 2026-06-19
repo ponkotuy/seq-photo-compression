@@ -13,22 +13,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Read tool versions
+        id: tool-versions
+        run: |
+          python_version="$(sed -n 's/^python = "\(.*\)"$/\1/p' mise.toml)"
+          uv_version="$(sed -n 's/^uv = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$python_version"
+          test -n "$uv_version"
+          echo "python-version=${python_version}" >> "$GITHUB_OUTPUT"
+          echo "uv-version=${uv_version}" >> "$GITHUB_OUTPUT"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
+          version: ${{ steps.tool-versions.outputs.uv-version }}
           enable-cache: true
-
-      - name: Read Python version
-        id: python-version
-        run: |
-          python_version="$(sed -n 's/^python = "\(.*\)"$/\1/p' mise.toml)"
-          test -n "$python_version"
-          echo "python-version=${python_version}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ steps.python-version.outputs.python-version }}
+          python-version: ${{ steps.tool-versions.outputs.python-version }}
 
       - name: Install dependencies
         run: uv sync --dev --locked
