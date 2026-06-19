@@ -1,0 +1,37 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ruff-format:
+    name: Ruff format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Read Python version
+        id: python-version
+        run: |
+          python_version="$(sed -n 's/^python = "\(.*\)"$/\1/p' mise.toml)"
+          test -n "$python_version"
+          echo "python-version=${python_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.python-version.outputs.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --dev --locked
+
+      - name: Check formatting
+        run: uv run ruff format --check .
