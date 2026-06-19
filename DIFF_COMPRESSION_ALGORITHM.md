@@ -1,6 +1,6 @@
 # 差分圧縮アルゴリズム
 
-この文書は、このアプリケーションの中心であるNEF連番写真向け差分圧縮の考え方と、現在の `spc.py` に実装されている処理をまとめたものです。
+この文書は、このアプリケーションの中心であるNEF連番写真向け差分圧縮の考え方と、現在の `seq_photo_compression` パッケージに実装されている処理をまとめたものです。
 
 ## 目的
 
@@ -113,7 +113,7 @@ JSONヘッダには、主に次の情報が入る。
 
 ## TIFF/NEF内のRAW strip検出
 
-`spc.py` は簡易TIFFパーサを持ち、NEF内のIFDとSubIFDを走査してRAW stripを探す。現在の判定は次の条件に基づく。
+`seq_photo_compression.tiff` は簡易TIFFパーサを持ち、NEF内のIFDとSubIFDを走査してRAW stripを探す。現在の判定は次の条件に基づく。
 
 - `StripOffsets`
 - `StripByteCounts`

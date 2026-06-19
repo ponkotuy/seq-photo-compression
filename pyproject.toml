@@ -9,11 +9,21 @@ dependencies = [
     "opencv-python>=4.10",
 ]
 
+[project.scripts]
+spc = "seq_photo_compression.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [dependency-groups]
 dev = [
     "radon>=6.0.1",
     "ruff>=0.12.0",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/seq_photo_compression"]
 
 [tool.ruff]
 line-length = 120

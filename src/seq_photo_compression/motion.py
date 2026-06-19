@@ -6,13 +6,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from seq_photo_compression.errors import MotionResidualError
+
 
 CHANNELS = 4
 RESIDUAL_OFFSET = 32768
-
-
-class MotionResidualError(RuntimeError):
-    pass
 
 
 @dataclass(frozen=True)
@@ -130,7 +128,6 @@ def estimate_motion(
     mode: str,
 ) -> tuple[np.ndarray, int, float, str]:
     warp_matrix = identity_matrix()
-    motion_mode = cv2.MOTION_AFFINE
     score = 0.0
     status = "ok"
 
