@@ -1,4 +1,6 @@
 # なにこれ
+[![Check](https://github.com/ponkotuy/seq-photo-compression/actions/workflows/check.yml/badge.svg)](https://github.com/ponkotuy/seq-photo-compression/actions/workflows/check.yml)
+
 画像の連続性を用いてNikonのRAW画像形式、NEFファイルを圧縮するコマンドラインツール。
 
 写真は連続して撮影した場合、比較的類似した画像になっている可能性が高い。この関係を利用して高圧縮なRAW画像形式を新規に作成することを目標とする。
