@@ -110,7 +110,7 @@ uv run spc restore 20260519/D8A_2000.NEF d8a_2001.spcraw -o restored_D8A_2001.NE
 uv run spc encode-dir 20260519 --diff-codec jxl --motion-mode ecc_affine
 ```
 
-`encode-dir` は同じディレクトリに `TARGET.NEF.spcraw` を出力する。カメラ機種、RAW画像サイズ、RAW圧縮形式、bits per sampleが一致するファイル同士だけを差分対象にし、独自形式が元NEF以上のサイズになる場合は `.spcraw` を残さず、そのNEFを新しいkeyframeとして扱う。RAW画素値の一致検証も行う場合は `--verify` を指定する。
+`encode-dir` は同じディレクトリに `TARGET.NEF.spcraw` を出力する。カメラ機種、RAW画像サイズ、RAW圧縮形式、bits per sampleが一致するファイル同士だけを差分対象にし、独自形式が元NEFの90%以上のサイズになる場合は `.spcraw` を残さず、そのNEFを新しいkeyframeとして扱う。閾値は `--max-archive-ratio` で変更できる。RAW画素値の一致検証も行う場合は `--verify` を指定する。
 
 `encode` は既定でJPEG XL Modularを使い、RGGB 4チャンネル分離した動き補償残差を保存する。従来の単純差分zstd方式を使う場合は `--diff-codec zstd` を指定する。
 

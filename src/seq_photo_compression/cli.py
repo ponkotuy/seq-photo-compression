@@ -290,6 +290,9 @@ def print_encode_dir_summary(
 def cmd_encode_dir(args: argparse.Namespace) -> None:
     directory = Path(args.directory)
     options = options_from_args(args)
+    max_archive_ratio = args.max_archive_ratio
+    if max_archive_ratio <= 0 or max_archive_ratio > 1:
+        raise SpcError("--max-archive-ratio must be greater than 0 and less than or equal to 1")
     files = iter_nef_files(directory)
     keyframes: dict[CompatibilitySignature, NefInspection] = {}
 
@@ -325,12 +328,16 @@ def cmd_encode_dir(args: argparse.Namespace) -> None:
                 target_raw=inspection.raw,
             )
 
-            if result.archive_size >= result.target_size:
+            if result.ratio >= max_archive_ratio:
                 result.archive.unlink(missing_ok=True)
                 keyframes[inspection.signature] = inspection
                 keyframe_count += 1
                 stored_size += target_size
-                print(f"oversized-keyframe: {nef.name} archive={result.archive_size:,} original={target_size:,}")
+                print(
+                    f"ratio-keyframe: {nef.name} "
+                    f"archive={result.archive_size:,} original={target_size:,} "
+                    f"ratio={result.ratio:.2%} threshold={max_archive_ratio:.2%}"
+                )
                 continue
 
             if args.verify:
@@ -455,6 +462,12 @@ def build_parser() -> argparse.ArgumentParser:
     encode_dir.add_argument("--motion-mode", choices=("none", "translation", "ecc_affine"), default="ecc_affine")
     encode_dir.add_argument("--jxl-effort", type=int, default=6, choices=range(1, 11), metavar="1-10")
     encode_dir.add_argument("--zstd-level", type=int, default=10, choices=range(1, 20), metavar="1-19")
+    encode_dir.add_argument(
+        "--max-archive-ratio",
+        type=float,
+        default=0.9,
+        help="make the target a new keyframe when archive/original is at or above this ratio",
+    )
     encode_dir.add_argument("--force", action="store_true", help="overwrite output archives")
     encode_dir.add_argument("--verify", action="store_true", help="verify RAW pixels for each created archive")
     encode_dir.set_defaults(func=cmd_encode_dir)
