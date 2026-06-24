@@ -7,6 +7,8 @@ from pathlib import Path
 from seq_photo_compression.errors import SpcError
 
 
+TAG_MAKE = 271
+TAG_MODEL = 272
 TAG_BITS_PER_SAMPLE = 258
 TAG_COMPRESSION = 259
 TAG_STRIP_OFFSETS = 273
@@ -115,6 +117,23 @@ class TiffParser:
             raise SpcError("TIFF tag points outside file")
         return list(struct.unpack_from(fmt, self.data, entry.data_offset))
 
+    def entry_text(self, entry: TiffEntry) -> str | None:
+        if entry.type_id != 2:
+            return None
+        if entry.data_offset + entry.count > len(self.data):
+            raise SpcError("TIFF tag points outside file")
+        raw = self.data[entry.data_offset : entry.data_offset + entry.count]
+        return raw.rstrip(b"\0").decode("ascii", errors="replace").strip()
+
+    def camera_make_model(self) -> tuple[str | None, str | None]:
+        ifd0 = self.parse_ifd(self.first_ifd)
+        make = ifd0.entries.get(TAG_MAKE)
+        model = ifd0.entries.get(TAG_MODEL)
+        return (
+            self.entry_text(make) if make is not None else None,
+            self.entry_text(model) if model is not None else None,
+        )
+
     def all_ifds(self) -> list[TiffIfd]:
         result: list[TiffIfd] = []
         seen: set[int] = set()
@@ -167,6 +186,22 @@ class TiffParser:
             strip_byte_count_entry_pos=ifd.entries[TAG_STRIP_BYTE_COUNTS].value_offset_pos,
             bits_per_sample_entry_pos=bits_entry.value_offset_pos if bits_entry is not None else None,
         )
+
+
+def read_raw_strip_info(nef_path: Path) -> RawStripInfo:
+    if not nef_path.is_file():
+        raise SpcError(f"NEF not found: {nef_path}")
+    data = nef_path.read_bytes()
+    parser = TiffParser(data)
+    return parser.find_raw_strip()
+
+
+def read_camera_make_model(nef_path: Path) -> tuple[str | None, str | None]:
+    if not nef_path.is_file():
+        raise SpcError(f"NEF not found: {nef_path}")
+    data = nef_path.read_bytes()
+    parser = TiffParser(data)
+    return parser.camera_make_model()
 
 
 def make_zeroed_shell(target_nef: Path) -> tuple[bytes, RawStripInfo]:
