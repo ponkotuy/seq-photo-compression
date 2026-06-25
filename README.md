@@ -104,6 +104,16 @@ uv run spc verify 20260519/D8A_2000.NEF 20260519/D8A_2001.NEF d8a_2001.spcraw
 uv run spc restore 20260519/D8A_2000.NEF d8a_2001.spcraw -o restored_D8A_2001.NEF
 ```
 
+差分を使わずに1枚のNEFを単体圧縮する場合:
+
+```sh
+uv run spc encode-single 20260519/D8A_1990.NEF -o d8a_1990.single.spcraw
+uv run spc verify-single 20260519/D8A_1990.NEF d8a_1990.single.spcraw
+uv run spc restore-single d8a_1990.single.spcraw -o restored_D8A_1990.NEF
+```
+
+`encode-single` は展開RAWをRGGB 4チャンネルPAMとしてJPEG XL Modular losslessで保存し、復元時は既存のNikon lossless 14bitエンコーダで元RAW stripを再生成する。対応できるNEFでは復元RAW画素に加えてRAW本体のバイナリ一致を検証する。RAW stripを再生成できない場合は既定で失敗するが、`--fallback raw-strip` を指定すると元RAW stripを直接zstd保存する。
+
 ディレクトリ内のNEFをファイル名順に処理する場合:
 
 ```sh

@@ -196,6 +196,11 @@ def read_raw_strip_info(nef_path: Path) -> RawStripInfo:
     return parser.find_raw_strip()
 
 
+def read_raw_strip_info_from_bytes(data: bytes) -> RawStripInfo:
+    parser = TiffParser(data)
+    return parser.find_raw_strip()
+
+
 def read_camera_make_model(nef_path: Path) -> tuple[str | None, str | None]:
     if not nef_path.is_file():
         raise SpcError(f"NEF not found: {nef_path}")

@@ -1,16 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from seq_photo_compression.archive import ARCHIVE_EXT, default_archive_path, read_archive, write_archive
+from seq_photo_compression.archive import (
+    ARCHIVE_EXT,
+    default_archive_path,
+    read_archive,
+    read_archive_chunks,
+    write_archive,
+    write_archive_chunks,
+)
 from seq_photo_compression.codecs import (
     build_diff,
+    decode_jxl_raw_rggb4,
+    encode_jxl_raw_rggb4,
     encode_jxl_residual,
     restore_raw_from_archive_payload,
     zstd_compress,
@@ -20,6 +31,7 @@ from seq_photo_compression.errors import SpcError
 from seq_photo_compression.nikon_lossless import (
     derive_nikon_lossless_14_restore_info,
     encode_nikon_lossless_14,
+    get_raw_strip_bytes,
     read_nikon_lossless_14_restore_info_from_makernote,
 )
 from seq_photo_compression.raw_io import extract_raw_array, raw_to_little_endian_bytes, sha256_file
@@ -30,6 +42,7 @@ from seq_photo_compression.tiff import (
     patch_shell_for_uncompressed_raw,
     read_camera_make_model,
     read_raw_strip_info,
+    read_raw_strip_info_from_bytes,
 )
 
 
@@ -57,6 +70,30 @@ class EncodeResult:
     @property
     def ratio(self) -> float:
         return self.archive_size / self.target_size
+
+
+@dataclass(frozen=True)
+class StandaloneEncodeResult:
+    target: Path
+    archive: Path
+    target_size: int
+    archive_size: int
+    raw_width: int
+    raw_height: int
+    raw_payload_size: int
+    shell_payload_size: int
+    raw_codec: str
+
+    @property
+    def ratio(self) -> float:
+        return self.archive_size / self.target_size
+
+
+@dataclass(frozen=True)
+class StandaloneVerifyResult:
+    raw_pixels_equal: bool
+    differing_pixels: int
+    raw_strip_equal: bool
 
 
 @dataclass(frozen=True)
@@ -100,6 +137,51 @@ def inspect_nef(path: Path) -> NefInspection:
         bits_per_sample=raw_info.bits_per_sample,
     )
     return NefInspection(path=path, raw=raw, raw_info=raw_info, signature=signature)
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def raw_strip_from_restore_info(raw: np.ndarray, raw_restore_info: dict) -> bytes:
+    if raw_restore_info.get("codec") != "nikon_lossless_14":
+        raise SpcError(f"unsupported restore RAW codec: {raw_restore_info.get('codec')}")
+    return encode_nikon_lossless_14(
+        raw,
+        raw_restore_info["initial_vpred"],
+        padding_bits=int(raw_restore_info.get("padding_bits", 0)),
+        padding_value=int(raw_restore_info.get("padding_value", 0)),
+        trailing_bytes=bytes.fromhex(str(raw_restore_info.get("trailing_bytes", ""))),
+    )
+
+
+def exact_nikon_restore_info(
+    target: Path, raw_info: RawStripInfo, target_raw: np.ndarray, target_strip: bytes
+) -> dict | None:
+    candidates: list[dict] = []
+    makernote_info = read_nikon_lossless_14_restore_info_from_makernote(target, raw_info)
+    if makernote_info is not None:
+        candidates.append(makernote_info)
+    try:
+        derived_info = derive_nikon_lossless_14_restore_info(target, raw_info, target_raw)
+    except SpcError:
+        derived_info = None
+    if derived_info is not None:
+        candidates.append(derived_info)
+
+    for raw_restore_info in candidates:
+        if raw_strip_from_restore_info(target_raw, raw_restore_info) == target_strip:
+            return raw_restore_info
+    return None
+
+
+def tiff_patch_header(raw_info: RawStripInfo) -> dict:
+    return {
+        "compression_entry_pos": raw_info.compression_entry_pos,
+        "strip_offset_entry_pos": raw_info.strip_offset_entry_pos,
+        "strip_byte_count_entry_pos": raw_info.strip_byte_count_entry_pos,
+        "bits_per_sample_entry_pos": raw_info.bits_per_sample_entry_pos,
+    }
 
 
 def encode_archive(
@@ -195,6 +277,160 @@ def encode_archive(
     )
 
 
+def encode_standalone_archive(
+    target: Path,
+    output: Path,
+    *,
+    jxl_effort: int,
+    zstd_level: int,
+    fallback: str,
+    force: bool,
+) -> StandaloneEncodeResult:
+    target = Path(target)
+    output = Path(output)
+    target_raw = extract_raw_array(target)
+    shell, raw_info = make_zeroed_shell(target)
+    target_strip = get_raw_strip_bytes(target, raw_info)
+    raw_restore_info = exact_nikon_restore_info(target, raw_info, target_raw, target_strip)
+
+    shell_zstd = zstd_compress(shell, zstd_level)
+    target_shell = {
+        "compression": "zstd",
+        "original_raw_compression_tag": raw_info.compression,
+        "original_bits_per_sample": raw_info.bits_per_sample,
+        "raw_restore": raw_restore_info,
+        "zeroed_raw_strip_offset": raw_info.strip_offset,
+        "zeroed_raw_strip_byte_count": raw_info.strip_byte_count,
+        "raw_strip_sha256": sha256_bytes(target_strip),
+        "tiff_patch": tiff_patch_header(raw_info),
+    }
+    header = {
+        "version": 2,
+        "mode": "standalone_jxl",
+        "target": {
+            "path": str(target),
+            "sha256": sha256_file(target),
+            "size": target.stat().st_size,
+        },
+        "raw": {
+            "width": int(target_raw.shape[1]),
+            "height": int(target_raw.shape[0]),
+            "dtype": "uint16",
+        },
+        "target_shell": target_shell,
+    }
+
+    if raw_restore_info is None:
+        if fallback != "raw-strip":
+            raise SpcError(
+                "target RAW strip cannot be regenerated exactly; pass --fallback raw-strip to store it directly"
+            )
+        raw_payload = zstd_compress(target_strip, zstd_level)
+        header["mode"] = "standalone_raw_strip"
+        header["raw_payload"] = {
+            "compression": "zstd",
+            "source": "original_raw_strip_bytes",
+            "zstd_level": zstd_level,
+        }
+        chunks = {
+            "shell_zstd": shell_zstd,
+            "raw_strip_zstd": raw_payload,
+        }
+        raw_codec = "raw_strip_zstd"
+    else:
+        raw_payload, raw_payload_header = encode_jxl_raw_rggb4(target_raw, effort=jxl_effort)
+        header["raw_payload"] = raw_payload_header
+
+        restored_raw = decode_jxl_raw_rggb4(header, raw_payload)
+        restored_strip = raw_strip_from_restore_info(restored_raw, raw_restore_info)
+        if restored_strip != target_strip:
+            raise SpcError("JXL roundtrip did not regenerate the original RAW strip")
+        chunks = {
+            "shell_zstd": shell_zstd,
+            "raw_jxl": raw_payload,
+        }
+        raw_codec = "jxl_modular_rggb4"
+
+    write_archive_chunks(output, header, chunks, force=force)
+    return StandaloneEncodeResult(
+        target=target,
+        archive=output,
+        target_size=target.stat().st_size,
+        archive_size=output.stat().st_size,
+        raw_width=int(target_raw.shape[1]),
+        raw_height=int(target_raw.shape[0]),
+        raw_payload_size=len(raw_payload),
+        shell_payload_size=len(shell_zstd),
+        raw_codec=raw_codec,
+    )
+
+
+def restore_standalone_nef(archive: Path) -> bytes:
+    header, chunks = read_archive_chunks(archive)
+    mode = header.get("mode")
+    if mode not in {"standalone_jxl", "standalone_raw_strip"}:
+        raise SpcError(f"archive is not a standalone archive: {mode}")
+
+    try:
+        shell = zstd_decompress(chunks["shell_zstd"])
+    except KeyError as exc:
+        raise SpcError("standalone archive is missing shell_zstd chunk") from exc
+
+    if mode == "standalone_raw_strip":
+        try:
+            raw_strip = zstd_decompress(chunks["raw_strip_zstd"])
+        except KeyError as exc:
+            raise SpcError("standalone raw-strip archive is missing raw_strip_zstd chunk") from exc
+    else:
+        try:
+            raw_jxl = chunks["raw_jxl"]
+        except KeyError as exc:
+            raise SpcError("standalone JXL archive is missing raw_jxl chunk") from exc
+        restored_raw = decode_jxl_raw_rggb4(header, raw_jxl)
+        raw_restore_info = header["target_shell"].get("raw_restore")
+        if raw_restore_info is None:
+            raise SpcError("standalone JXL archive is missing RAW restore metadata")
+        raw_strip = raw_strip_from_restore_info(restored_raw, raw_restore_info)
+
+    expected_sha256 = header["target_shell"].get("raw_strip_sha256")
+    if expected_sha256 is not None and sha256_bytes(raw_strip) != expected_sha256:
+        raise SpcError("restored RAW strip SHA-256 does not match archive metadata")
+    return patch_shell_for_nikon_compressed_raw(
+        shell,
+        header["target_shell"],
+        header["target_shell"]["tiff_patch"],
+        raw_strip,
+    )
+
+
+def verify_standalone_archive(target: Path, archive: Path) -> StandaloneVerifyResult:
+    target_raw = extract_raw_array(target)
+    restored_nef = restore_standalone_nef(archive)
+    target_info = read_raw_strip_info(target)
+    restored_info = read_raw_strip_info_from_bytes(restored_nef)
+    target_strip = get_raw_strip_bytes(target, target_info)
+    restored_strip = restored_nef[
+        restored_info.strip_offset : restored_info.strip_offset + restored_info.strip_byte_count
+    ]
+
+    header, chunks = read_archive_chunks(archive)
+    if header.get("mode") == "standalone_jxl":
+        restored_raw = decode_jxl_raw_rggb4(header, chunks["raw_jxl"])
+    else:
+        with tempfile.TemporaryDirectory(prefix="spc-verify-single-") as tmp:
+            restored_path = Path(tmp) / "restored.NEF"
+            restored_path.write_bytes(restored_nef)
+            restored_raw = extract_raw_array(restored_path)
+    raw_pixels_equal = np.array_equal(restored_raw, target_raw)
+    differing_pixels = 0 if raw_pixels_equal else int(np.count_nonzero(restored_raw != target_raw))
+
+    return StandaloneVerifyResult(
+        raw_pixels_equal=raw_pixels_equal,
+        differing_pixels=differing_pixels,
+        raw_strip_equal=restored_strip == target_strip,
+    )
+
+
 def print_encode_result(result: EncodeResult) -> None:
     print(f"archive: {result.archive}")
     print(f"target NEF size: {result.target_size:,} bytes")
@@ -213,11 +449,35 @@ def print_encode_result(result: EncodeResult) -> None:
     print(f"restore RAW codec: {result.restore_codec}")
 
 
+def print_standalone_encode_result(result: StandaloneEncodeResult) -> None:
+    print(f"archive: {result.archive}")
+    print(f"target NEF size: {result.target_size:,} bytes")
+    print(f"archive size: {result.archive_size:,} bytes ({result.ratio:.2%} of target)")
+    print(f"raw shape: {result.raw_width}x{result.raw_height}")
+    print(f"raw codec: {result.raw_codec}")
+    print(f"raw payload size: {result.raw_payload_size:,} bytes")
+    print(f"shell payload size: {result.shell_payload_size:,} bytes")
+
+
 def cmd_encode(args: argparse.Namespace) -> None:
     target = Path(args.target)
     output = Path(args.output) if args.output else default_archive_path(target)
     result = encode_archive(Path(args.keyframe), target, output, options_from_args(args))
     print_encode_result(result)
+
+
+def cmd_encode_single(args: argparse.Namespace) -> None:
+    target = Path(args.target)
+    output = Path(args.output) if args.output else default_archive_path(target)
+    result = encode_standalone_archive(
+        target,
+        output,
+        jxl_effort=args.jxl_effort,
+        zstd_level=args.zstd_level,
+        fallback=args.fallback,
+        force=args.force,
+    )
+    print_standalone_encode_result(result)
 
 
 def verify_raw_pixels(
@@ -252,6 +512,17 @@ def cmd_verify(args: argparse.Namespace) -> None:
     print(f"differing pixels: {differing}")
     if not equal:
         raise SpcError("restored RAW does not match target RAW")
+
+
+def cmd_verify_single(args: argparse.Namespace) -> None:
+    result = verify_standalone_archive(Path(args.target), Path(args.archive))
+    print(f"raw pixels match: {result.raw_pixels_equal}")
+    print(f"differing pixels: {result.differing_pixels}")
+    print(f"raw strip match: {result.raw_strip_equal}")
+    if not result.raw_pixels_equal:
+        raise SpcError("restored RAW pixels do not match target RAW")
+    if not result.raw_strip_equal:
+        raise SpcError("restored RAW strip does not match target NEF")
 
 
 def iter_nef_files(directory: Path) -> list[Path]:
@@ -436,8 +707,21 @@ def cmd_restore(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_restore_single(args: argparse.Namespace) -> None:
+    archive = Path(args.archive)
+    output = Path(args.output)
+    if output.exists() and not args.force:
+        raise SpcError(f"output exists, pass --force to overwrite: {output}")
+
+    restored_nef = restore_standalone_nef(archive)
+    output.write_bytes(restored_nef)
+    print(f"restored NEF file: {output}")
+    print(f"output size: {output.stat().st_size:,} bytes")
+    print("restore RAW codec: original_nikon_strip")
+
+
 def cmd_info(args: argparse.Namespace) -> None:
-    header, _shell_zstd, _diff_zstd = read_archive(Path(args.archive))
+    header, _chunks = read_archive_chunks(Path(args.archive))
     print(json.dumps(header, indent=2, ensure_ascii=False, sort_keys=True))
 
 
@@ -455,6 +739,20 @@ def build_parser() -> argparse.ArgumentParser:
     encode.add_argument("--zstd-level", type=int, default=10, choices=range(1, 20), metavar="1-19")
     encode.add_argument("--force", action="store_true", help="overwrite output archive")
     encode.set_defaults(func=cmd_encode)
+
+    encode_single = sub.add_parser("encode-single", help="create a standalone lossless archive for one NEF")
+    encode_single.add_argument("target", help="NEF to encode as a standalone custom format")
+    encode_single.add_argument("-o", "--output", help=f"output archive path, default: TARGET.NEF{ARCHIVE_EXT}")
+    encode_single.add_argument("--jxl-effort", type=int, default=6, choices=range(1, 11), metavar="1-10")
+    encode_single.add_argument("--zstd-level", type=int, default=10, choices=range(1, 20), metavar="1-19")
+    encode_single.add_argument(
+        "--fallback",
+        choices=("fail", "raw-strip"),
+        default="fail",
+        help="what to do when the RAW strip cannot be regenerated exactly",
+    )
+    encode_single.add_argument("--force", action="store_true", help="overwrite output archive")
+    encode_single.set_defaults(func=cmd_encode_single)
 
     encode_dir = sub.add_parser("encode-dir", help="encode NEF files in a directory as a storage set")
     encode_dir.add_argument("directory", help="directory containing NEF files")
@@ -478,6 +776,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("archive")
     verify.set_defaults(func=cmd_verify)
 
+    verify_single = sub.add_parser("verify-single", help="verify a standalone archive against its source NEF")
+    verify_single.add_argument("target")
+    verify_single.add_argument("archive")
+    verify_single.set_defaults(func=cmd_verify_single)
+
     restore = sub.add_parser("restore", help="restore a NEF-like file from keyframe and archive")
     restore.add_argument("keyframe")
     restore.add_argument("archive")
@@ -485,6 +788,12 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--raw-output", choices=("auto", "nikon", "uncompressed"), default="auto")
     restore.add_argument("--force", action="store_true", help="overwrite output file")
     restore.set_defaults(func=cmd_restore)
+
+    restore_single = sub.add_parser("restore-single", help="restore a NEF file from a standalone archive")
+    restore_single.add_argument("archive")
+    restore_single.add_argument("-o", "--output", required=True)
+    restore_single.add_argument("--force", action="store_true", help="overwrite output file")
+    restore_single.set_defaults(func=cmd_restore_single)
 
     info = sub.add_parser("info", help="print archive metadata")
     info.add_argument("archive")
