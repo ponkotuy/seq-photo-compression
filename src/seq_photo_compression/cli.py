@@ -29,6 +29,7 @@ from seq_photo_compression.codecs import (
 )
 from seq_photo_compression.errors import SpcError
 from seq_photo_compression.nikon_lossless import (
+    complete_nikon_lossless_14_restore_info,
     derive_nikon_lossless_14_restore_info,
     encode_nikon_lossless_14,
     get_raw_strip_bytes,
@@ -83,6 +84,7 @@ class StandaloneEncodeResult:
     raw_payload_size: int
     shell_payload_size: int
     raw_codec: str
+    encode_verify: str
 
     @property
     def ratio(self) -> float:
@@ -173,6 +175,22 @@ def exact_nikon_restore_info(
         if raw_strip_from_restore_info(target_raw, raw_restore_info) == target_strip:
             return raw_restore_info
     return None
+
+
+def standalone_restore_info(
+    target: Path,
+    raw_info: RawStripInfo,
+    target_raw: np.ndarray,
+    target_strip: bytes,
+    *,
+    encode_verify: str,
+) -> dict | None:
+    raw_restore_info = read_nikon_lossless_14_restore_info_from_makernote(target, raw_info)
+    if raw_restore_info is not None:
+        return complete_nikon_lossless_14_restore_info(target_raw, raw_restore_info, target_strip)
+    if encode_verify != "strip":
+        return raw_restore_info
+    return exact_nikon_restore_info(target, raw_info, target_raw, target_strip)
 
 
 def tiff_patch_header(raw_info: RawStripInfo) -> dict:
@@ -284,6 +302,7 @@ def encode_standalone_archive(
     jxl_effort: int,
     zstd_level: int,
     fallback: str,
+    encode_verify: str,
     force: bool,
 ) -> StandaloneEncodeResult:
     target = Path(target)
@@ -291,7 +310,13 @@ def encode_standalone_archive(
     target_raw = extract_raw_array(target)
     shell, raw_info = make_zeroed_shell(target)
     target_strip = get_raw_strip_bytes(target, raw_info)
-    raw_restore_info = exact_nikon_restore_info(target, raw_info, target_raw, target_strip)
+    raw_restore_info = standalone_restore_info(
+        target,
+        raw_info,
+        target_raw,
+        target_strip,
+        encode_verify=encode_verify,
+    )
 
     shell_zstd = zstd_compress(shell, zstd_level)
     target_shell = {
@@ -317,13 +342,15 @@ def encode_standalone_archive(
             "height": int(target_raw.shape[0]),
             "dtype": "uint16",
         },
+        "encode_verify": encode_verify,
         "target_shell": target_shell,
     }
 
     if raw_restore_info is None:
         if fallback != "raw-strip":
             raise SpcError(
-                "target RAW strip cannot be regenerated exactly; pass --fallback raw-strip to store it directly"
+                "target RAW restore metadata is unavailable; pass --encode-verify strip to derive it slowly, "
+                "or pass --fallback raw-strip to store the RAW strip directly"
             )
         raw_payload = zstd_compress(target_strip, zstd_level)
         header["mode"] = "standalone_raw_strip"
@@ -341,10 +368,14 @@ def encode_standalone_archive(
         raw_payload, raw_payload_header = encode_jxl_raw_rggb4(target_raw, effort=jxl_effort)
         header["raw_payload"] = raw_payload_header
 
-        restored_raw = decode_jxl_raw_rggb4(header, raw_payload)
-        restored_strip = raw_strip_from_restore_info(restored_raw, raw_restore_info)
-        if restored_strip != target_strip:
-            raise SpcError("JXL roundtrip did not regenerate the original RAW strip")
+        if encode_verify in {"pixels", "strip"}:
+            restored_raw = decode_jxl_raw_rggb4(header, raw_payload)
+            if not np.array_equal(restored_raw, target_raw):
+                raise SpcError("JXL roundtrip did not restore the original RAW pixels")
+            if encode_verify == "strip":
+                restored_strip = raw_strip_from_restore_info(restored_raw, raw_restore_info)
+                if restored_strip != target_strip:
+                    raise SpcError("JXL roundtrip did not regenerate the original RAW strip")
         chunks = {
             "shell_zstd": shell_zstd,
             "raw_jxl": raw_payload,
@@ -362,6 +393,7 @@ def encode_standalone_archive(
         raw_payload_size=len(raw_payload),
         shell_payload_size=len(shell_zstd),
         raw_codec=raw_codec,
+        encode_verify=encode_verify,
     )
 
 
@@ -455,6 +487,7 @@ def print_standalone_encode_result(result: StandaloneEncodeResult) -> None:
     print(f"archive size: {result.archive_size:,} bytes ({result.ratio:.2%} of target)")
     print(f"raw shape: {result.raw_width}x{result.raw_height}")
     print(f"raw codec: {result.raw_codec}")
+    print(f"encode verify: {result.encode_verify}")
     print(f"raw payload size: {result.raw_payload_size:,} bytes")
     print(f"shell payload size: {result.shell_payload_size:,} bytes")
 
@@ -475,6 +508,7 @@ def cmd_encode_single(args: argparse.Namespace) -> None:
         jxl_effort=args.jxl_effort,
         zstd_level=args.zstd_level,
         fallback=args.fallback,
+        encode_verify=args.encode_verify,
         force=args.force,
     )
     print_standalone_encode_result(result)
@@ -745,6 +779,12 @@ def build_parser() -> argparse.ArgumentParser:
     encode_single.add_argument("-o", "--output", help=f"output archive path, default: TARGET.NEF{ARCHIVE_EXT}")
     encode_single.add_argument("--jxl-effort", type=int, default=6, choices=range(1, 11), metavar="1-10")
     encode_single.add_argument("--zstd-level", type=int, default=10, choices=range(1, 20), metavar="1-19")
+    encode_single.add_argument(
+        "--encode-verify",
+        choices=("none", "pixels", "strip"),
+        default="none",
+        help="optional encode-time verification; use verify-single for full verification after encoding",
+    )
     encode_single.add_argument(
         "--fallback",
         choices=("fail", "raw-strip"),

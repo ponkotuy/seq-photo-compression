@@ -132,6 +132,11 @@ def build_huffman_decoder(tree: tuple[int, ...]) -> dict[tuple[int, int], int]:
 NIKON_LOSSLESS_14_CODES = build_huffman_codes(NIKON_LOSSLESS_14_TREE)
 NIKON_LOSSLESS_14_DECODER = build_huffman_decoder(NIKON_LOSSLESS_14_TREE)
 NIKON_LOSSLESS_14_MAX_CODE_BITS = max(length for _code, length in NIKON_LOSSLESS_14_CODES.values())
+NIKON_LOSSLESS_14_CODE_BITS_BY_LENGTH = np.array(
+    [NIKON_LOSSLESS_14_CODES[length][1] for length in range(15)],
+    dtype=np.uint8,
+)
+UINT14_BIT_LENGTHS = np.array([value.bit_length() for value in range(0x4000 + 1)], dtype=np.uint8)
 
 
 def _tiff_endian(data: bytes, offset: int) -> str:
@@ -324,6 +329,63 @@ def derive_nikon_lossless_14_restore_info(
         "padding_value": reader.bitbuf,
         "trailing_bytes": strip[reader.byte_pos :].hex(),
     }
+
+
+def complete_nikon_lossless_14_restore_info(
+    raw: np.ndarray,
+    restore_info: dict,
+    original_strip: bytes,
+    *,
+    chunk_rows: int = 256,
+) -> dict:
+    if raw.dtype != np.uint16:
+        raw = raw.astype(np.uint16, copy=False)
+    if restore_info.get("codec") != "nikon_lossless_14":
+        raise SpcError(f"unsupported restore RAW codec: {restore_info.get('codec')}")
+    if int(raw.max()) > 0x3FFF:
+        raise SpcError("Nikon lossless 14-bit output requires RAW values in 0..16383")
+
+    height, width = raw.shape
+    initial_vpred = restore_info["initial_vpred"]
+    total_bits = 0
+
+    for start in range(0, height, chunk_rows):
+        end = min(start + chunk_rows, height)
+        rows = np.arange(start, end)
+        diff = np.empty((end - start, width), dtype=np.int32)
+
+        diff[:, 0] = raw[start:end, 0].astype(np.int32)
+        diff[:, 1] = raw[start:end, 1].astype(np.int32)
+        first_even = rows % 2 == 0
+        has_previous_same_parity = rows >= 2
+        diff[first_even & ~has_previous_same_parity, 0] -= int(initial_vpred[0][0])
+        diff[~first_even & ~has_previous_same_parity, 0] -= int(initial_vpred[1][0])
+        diff[first_even & ~has_previous_same_parity, 1] -= int(initial_vpred[0][1])
+        diff[~first_even & ~has_previous_same_parity, 1] -= int(initial_vpred[1][1])
+        if np.any(has_previous_same_parity):
+            previous_rows = rows[has_previous_same_parity] - 2
+            diff[has_previous_same_parity, 0] -= raw[previous_rows, 0].astype(np.int32)
+            diff[has_previous_same_parity, 1] -= raw[previous_rows, 1].astype(np.int32)
+
+        diff[:, 2:] = raw[start:end, 2:].astype(np.int32) - raw[start:end, :-2].astype(np.int32)
+        abs_diff = np.abs(diff)
+        if int(abs_diff.max()) > 0x3FFF:
+            raise SpcError("Nikon lossless diff does not fit 14 bits")
+        lengths = UINT14_BIT_LENGTHS[abs_diff]
+        total_bits += int((NIKON_LOSSLESS_14_CODE_BITS_BY_LENGTH[lengths] + lengths).sum())
+
+    encoded_byte_count = (total_bits + 7) // 8
+    if encoded_byte_count > len(original_strip):
+        raise SpcError("computed Nikon lossless bitstream is longer than the original RAW strip")
+    padding_bits = encoded_byte_count * 8 - total_bits
+    padding_value = original_strip[encoded_byte_count - 1] & ((1 << padding_bits) - 1) if padding_bits else 0
+
+    completed = dict(restore_info)
+    completed["padding_bits"] = int(padding_bits)
+    completed["padding_value"] = int(padding_value)
+    completed["trailing_bytes"] = original_strip[encoded_byte_count:].hex()
+    completed["padding_source"] = "computed_bit_length"
+    return completed
 
 
 def encode_nikon_lossless_14(
