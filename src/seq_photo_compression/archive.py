@@ -82,4 +82,4 @@ def write_archive(path: Path, header: dict, shell_zstd: bytes, diff_zstd: bytes,
 
 
 def default_archive_path(target: Path) -> Path:
-    return target.with_suffix(target.suffix + ARCHIVE_EXT)
+    return target.with_suffix(ARCHIVE_EXT)

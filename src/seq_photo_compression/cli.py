@@ -47,6 +47,9 @@ from seq_photo_compression.tiff import (
 )
 
 
+RESTORED_EXT = ".NEF"
+
+
 @dataclass(frozen=True)
 class EncodeOptions:
     diff_codec: str
@@ -500,18 +503,62 @@ def cmd_encode(args: argparse.Namespace) -> None:
 
 
 def cmd_encode_single(args: argparse.Namespace) -> None:
-    target = Path(args.target)
-    output = Path(args.output) if args.output else default_archive_path(target)
-    result = encode_standalone_archive(
-        target,
-        output,
-        jxl_effort=args.jxl_effort,
-        zstd_level=args.zstd_level,
-        fallback=args.fallback,
-        encode_verify=args.encode_verify,
-        force=args.force,
-    )
-    print_standalone_encode_result(result)
+    targets = [Path(target) for target in args.targets]
+    if args.output and len(targets) > 1:
+        raise SpcError("-o/--output can only be used with one encode-single target")
+
+    if len(targets) == 1:
+        target = targets[0]
+        output = Path(args.output) if args.output else default_archive_path(target)
+        result = encode_standalone_archive(
+            target,
+            output,
+            jxl_effort=args.jxl_effort,
+            zstd_level=args.zstd_level,
+            fallback=args.fallback,
+            encode_verify=args.encode_verify,
+            force=args.force,
+        )
+        print_standalone_encode_result(result)
+        return
+
+    original_size = 0
+    archive_size = 0
+    encoded_count = 0
+    failed_count = 0
+    for target in targets:
+        try:
+            result = encode_standalone_archive(
+                target,
+                default_archive_path(target),
+                jxl_effort=args.jxl_effort,
+                zstd_level=args.zstd_level,
+                fallback=args.fallback,
+                encode_verify=args.encode_verify,
+                force=args.force,
+            )
+            original_size += result.target_size
+            archive_size += result.archive_size
+            encoded_count += 1
+            print(
+                f"encoded: {target.name} -> {result.archive.name} "
+                f"{result.archive_size:,}/{result.target_size:,} ({result.ratio:.2%})"
+            )
+        except SpcError as exc:
+            failed_count += 1
+            print(f"failed: {target}: {exc}")
+
+    print("summary:")
+    print(f"encoded NEF total: {original_size:,} bytes")
+    print(f"archive total: {archive_size:,} bytes")
+    print(f"encoded: {encoded_count}")
+    print(f"failed: {failed_count}")
+    if failed_count:
+        raise SpcError(f"{failed_count} encode-single target(s) failed")
+
+
+def default_restored_path(archive: Path) -> Path:
+    return Path(archive).with_suffix(RESTORED_EXT)
 
 
 def verify_raw_pixels(
@@ -693,7 +740,7 @@ def cmd_encode_dir(args: argparse.Namespace) -> None:
 def cmd_restore(args: argparse.Namespace) -> None:
     keyframe = Path(args.keyframe)
     archive = Path(args.archive)
-    output = Path(args.output)
+    output = Path(args.output) if args.output else default_restored_path(archive)
     if output.exists() and not args.force:
         raise SpcError(f"output exists, pass --force to overwrite: {output}")
 
@@ -743,7 +790,7 @@ def cmd_restore(args: argparse.Namespace) -> None:
 
 def cmd_restore_single(args: argparse.Namespace) -> None:
     archive = Path(args.archive)
-    output = Path(args.output)
+    output = Path(args.output) if args.output else default_restored_path(archive)
     if output.exists() and not args.force:
         raise SpcError(f"output exists, pass --force to overwrite: {output}")
 
@@ -766,7 +813,7 @@ def build_parser() -> argparse.ArgumentParser:
     encode = sub.add_parser("encode", help="create an archive for the second NEF using a keyframe NEF")
     encode.add_argument("keyframe", help="first NEF kept as keyframe")
     encode.add_argument("target", help="second NEF to encode as custom format")
-    encode.add_argument("-o", "--output", help=f"output archive path, default: TARGET.NEF{ARCHIVE_EXT}")
+    encode.add_argument("-o", "--output", help=f"output archive path, default: TARGET{ARCHIVE_EXT}")
     encode.add_argument("--diff-codec", choices=("zstd", "jxl"), default="jxl")
     encode.add_argument("--motion-mode", choices=("none", "translation", "ecc_affine"), default="ecc_affine")
     encode.add_argument("--jxl-effort", type=int, default=6, choices=range(1, 11), metavar="1-10")
@@ -775,8 +822,8 @@ def build_parser() -> argparse.ArgumentParser:
     encode.set_defaults(func=cmd_encode)
 
     encode_single = sub.add_parser("encode-single", help="create a standalone lossless archive for one NEF")
-    encode_single.add_argument("target", help="NEF to encode as a standalone custom format")
-    encode_single.add_argument("-o", "--output", help=f"output archive path, default: TARGET.NEF{ARCHIVE_EXT}")
+    encode_single.add_argument("targets", nargs="+", help="NEF file(s) to encode as standalone custom archives")
+    encode_single.add_argument("-o", "--output", help=f"output archive path, default: TARGET{ARCHIVE_EXT}")
     encode_single.add_argument("--jxl-effort", type=int, default=6, choices=range(1, 11), metavar="1-10")
     encode_single.add_argument("--zstd-level", type=int, default=10, choices=range(1, 20), metavar="1-19")
     encode_single.add_argument(
@@ -824,14 +871,14 @@ def build_parser() -> argparse.ArgumentParser:
     restore = sub.add_parser("restore", help="restore a NEF-like file from keyframe and archive")
     restore.add_argument("keyframe")
     restore.add_argument("archive")
-    restore.add_argument("-o", "--output", required=True)
+    restore.add_argument("-o", "--output", help=f"output path, default: ARCHIVE{RESTORED_EXT}")
     restore.add_argument("--raw-output", choices=("auto", "nikon", "uncompressed"), default="auto")
     restore.add_argument("--force", action="store_true", help="overwrite output file")
     restore.set_defaults(func=cmd_restore)
 
     restore_single = sub.add_parser("restore-single", help="restore a NEF file from a standalone archive")
     restore_single.add_argument("archive")
-    restore_single.add_argument("-o", "--output", required=True)
+    restore_single.add_argument("-o", "--output", help=f"output path, default: ARCHIVE{RESTORED_EXT}")
     restore_single.add_argument("--force", action="store_true", help="overwrite output file")
     restore_single.set_defaults(func=cmd_restore_single)
 

@@ -112,6 +112,12 @@ uv run spc verify-single 20260519/D8A_1990.NEF d8a_1990.single.spcraw
 uv run spc restore-single d8a_1990.single.spcraw -o restored_D8A_1990.NEF
 ```
 
+複数のNEFを単体圧縮する場合は、各ファイルの拡張子を `.spcraw` に置き換えた名前で出力する:
+
+```sh
+uv run spc encode-single 20260519/*.NEF
+```
+
 `encode-single` は展開RAWをRGGB 4チャンネルPAMとしてJPEG XL Modular losslessで保存し、復元時は既存のNikon lossless 14bitエンコーダで元RAW stripを再生成する。既定では速度優先でMakerNoteの復元情報を信頼し、encode中の重いRAW strip再生成検証は行わない。保存後に `verify-single` を実行すると、復元RAW画素とRAW本体のバイナリ一致を確認できる。encode中にも確認したい場合は `--encode-verify pixels` または `--encode-verify strip` を指定する。RAW stripを再生成できない場合は既定で失敗するが、`--fallback raw-strip` を指定すると元RAW stripを直接zstd保存する。
 
 ディレクトリ内のNEFをファイル名順に処理する場合:
@@ -120,7 +126,7 @@ uv run spc restore-single d8a_1990.single.spcraw -o restored_D8A_1990.NEF
 uv run spc encode-dir 20260519 --diff-codec jxl --motion-mode ecc_affine
 ```
 
-`encode-dir` は同じディレクトリに `TARGET.NEF.spcraw` を出力する。カメラ機種、RAW画像サイズ、RAW圧縮形式、bits per sampleが一致するファイル同士だけを差分対象にし、独自形式が元NEFの90%以上のサイズになる場合は `.spcraw` を残さず、そのNEFを新しいkeyframeとして扱う。閾値は `--max-archive-ratio` で変更できる。RAW画素値の一致検証も行う場合は `--verify` を指定する。
+`encode-dir` は同じディレクトリに `TARGET.spcraw` を出力する。カメラ機種、RAW画像サイズ、RAW圧縮形式、bits per sampleが一致するファイル同士だけを差分対象にし、独自形式が元NEFの90%以上のサイズになる場合は `.spcraw` を残さず、そのNEFを新しいkeyframeとして扱う。閾値は `--max-archive-ratio` で変更できる。RAW画素値の一致検証も行う場合は `--verify` を指定する。
 
 `encode` は既定でJPEG XL Modularを使い、RGGB 4チャンネル分離した動き補償残差を保存する。従来の単純差分zstd方式を使う場合は `--diff-codec zstd` を指定する。
 
